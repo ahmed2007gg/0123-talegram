@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Telegram Universal Downloader Bot - Admin Edition
+# Universal Downloader Bot - Admin Edition with Full Fixes
+# يدعم: تحميل فيديوهات/صور/صوت من أي منصة
 # مع نظام إدارة المستخدمين وحظر/تفعيل الصلاحيات
 
 import os
 import re
 import sqlite3
 import logging
+import asyncio
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -21,11 +23,23 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
 # معرف الأدمن الأساسي (ضع معرفك هنا)
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "123456789"))  # استبدل بـ ID الخاص بك
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "123456789"))
 
 # مجلد التحميلات المؤقتة
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# إعدادات yt-dlp المحسنة
+YDL_OPTS_BASE = {
+    'quiet': True,
+    'no_warnings': True,
+    'ignoreerrors': True,
+    'no_check_certificate': True,
+    'retries': 10,
+    'fragment_retries': 10,
+    'sleep_interval': 1,
+    'max_sleep_interval': 3,
+}
 
 # ==================== قاعدة البيانات ====================
 
@@ -69,6 +83,7 @@ def init_db():
     
     conn.commit()
     conn.close()
+    print("✅ قاعدة البيانات جاهزة")
 
 def is_allowed(chat_id):
     """التحقق مما إذا كان المستخدم مصرحاً له ونشطاً"""
@@ -91,7 +106,7 @@ def add_user(chat_id, username, first_name, last_name, added_by):
         c.execute('''
             INSERT OR REPLACE INTO allowed_users (chat_id, username, first_name, last_name, added_by, added_date, is_active)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (chat_id, username, first_name, last_name, added_by, datetime.now().isoformat(), 1))
+        ''', (chat_id, username or "no_username", first_name or "Unknown", last_name or "", added_by, datetime.now().isoformat(), 1))
         conn.commit()
         return True
     except Exception as e:
@@ -132,7 +147,7 @@ def log_usage(chat_id, username, action, url=''):
     c.execute('''
         INSERT INTO usage_logs (chat_id, username, action, url, timestamp)
         VALUES (?, ?, ?, ?, ?)
-    ''', (chat_id, username, action, url, datetime.now().isoformat()))
+    ''', (chat_id, username or "unknown", action, url, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -153,7 +168,7 @@ def get_usage_logs(limit=50):
 # ==================== أوامر الأدمن ====================
 
 async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إضافة مستخدم جديد (للأدمن فقط) - استخدم /adduser <chat_id>"""
+    """إضافة مستخدم جديد (للأدمن فقط)"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ هذا الأمر مخصص للأدمن فقط.")
         return
@@ -164,11 +179,10 @@ async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         chat_id = int(context.args[0])
-        # محاولة جلب معلومات المستخدم (اختياري)
         try:
             chat = await context.bot.get_chat(chat_id)
             username = chat.username or "no_username"
-            first_name = chat.first_name or ""
+            first_name = chat.first_name or "Unknown"
             last_name = chat.last_name or ""
         except:
             username = "unknown"
@@ -183,7 +197,7 @@ async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ يرجى إدخال Chat ID صحيح (أرقام فقط).")
 
 async def removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """حظر مستخدم (للأدمن فقط) - استخدم /removeuser <chat_id>"""
+    """حظر مستخدم (للأدمن فقط)"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ هذا الأمر مخصص للأدمن فقط.")
         return
@@ -222,19 +236,18 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ هذا الأمر مخصص للأدمن فقط.")
         return
     
-    users = get_all_users()
-    if not users:
+    users_list = get_all_users()
+    if not users_list:
         await update.message.reply_text("📭 لا يوجد مستخدمين مسجلين حتى الآن.")
         return
     
     msg = "📋 *قائمة المستخدمين المصرح لهم:*\n\n"
-    for user in users:
+    for user in users_list:
         chat_id, username, first_name, last_name, added_date, is_active = user
         status = "✅ نشط" if is_active == 1 else "⛔ محظور"
         name = first_name or username or str(chat_id)
         msg += f"• `{chat_id}` - {name} - {status}\n"
     
-    # تقسيم الرسالة إذا كانت طويلة
     if len(msg) > 4000:
         msg = msg[:4000] + "\n...(مختصر)"
     
@@ -246,8 +259,7 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ هذا الأمر مخصص للأدمن فقط.")
         return
     
-    log_limit = 30
-    logs_data = get_usage_logs(log_limit)
+    logs_data = get_usage_logs(30)
     
     if not logs_data:
         await update.message.reply_text("📭 لا توجد سجلات استخدام حتى الآن.")
@@ -268,9 +280,8 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """الحصول على Chat ID الخاص بالمستخدم (لأي شخص)"""
+    """الحصول على Chat ID الخاص بالمستخدم"""
     user = update.effective_user
-    chat = update.effective_chat
     
     msg = f"""
 🆔 *معلومات الحساب:*
@@ -286,7 +297,7 @@ async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أوامر الأدمن (للأدمن فقط)"""
+    """أوامر الأدمن"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ هذا الأمر مخصص للأدمن فقط.")
         return
@@ -303,25 +314,89 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📌 *لجلب أي Chat ID:*
 اطلب من المستخدم إرسال الأمر `/getid`
-
-💡 *نصيحة:* يمكنك إضافة مستخدمين تلقائياً عندما يرسلون أمر `/getid` أو يرسلون رابطاً (اختياري)
 """
     await update.message.reply_text(help_msg, parse_mode="Markdown")
 
-# ==================== وظائف البوت الأساسية ====================
+# ==================== وظائف التحميل والتشغيل ====================
+
+async def get_video_info(url):
+    """جلب معلومات الفيديو مع إعدادات صحيحة"""
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'ignoreerrors': True,
+            'no_check_certificate': True,
+        }
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info
+    except Exception as e:
+        logger.error(f"Error getting video info: {e}")
+        return None
+
+async def download_media(url, format_type='video', quality='best'):
+    """تحميل الوسائط مع إعدادات محسنة"""
+    filename = None
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'paths': {'home': DOWNLOAD_DIR},
+            'outtmpl': '%(title)s.%(ext)s',
+            'ignoreerrors': True,
+            'no_check_certificate': True,
+            'retries': 10,
+            'fragment_retries': 10,
+            'sleep_interval': 1,
+            'max_sleep_interval': 3,
+        }
+        
+        if format_type == 'audio':
+            ydl_opts['format'] = 'bestaudio/best'
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+        elif format_type == 'video':
+            if quality == 'best':
+                ydl_opts['format'] = 'best[height<=720]/best'
+            else:
+                ydl_opts['format'] = 'worst'
+        
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info:
+                filename = ydl.prepare_filename(info)
+                if format_type == 'audio':
+                    filename = filename.rsplit('.', 1)[0] + '.mp3'
+                
+                if os.path.exists(filename):
+                    return filename
+                
+                if format_type == 'audio':
+                    mp3_file = filename.rsplit('.', 1)[0] + '.mp3'
+                    if os.path.exists(mp3_file):
+                        return mp3_file
+            
+            return None
+            
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """رسالة الترحيب"""
     user = update.effective_user
     chat_id = user.id
     
-    # التحقق من الصلاحية
     if not is_allowed(chat_id):
         await update.message.reply_text(
-            "⛔ *غير مصرح لك باستخدام هذا البوت.*\n\n"
-            "يرجى التواصل مع الأدمن لإضافتك.\n\n"
+            f"⛔ *غير مصرح لك باستخدام هذا البوت.*\n\n"
+            f"يرجى التواصل مع الأدمن لإضافتك.\n\n"
             f"🆔 معرفك: `{chat_id}`\n\n"
-            "أرسل هذا المعرف للأدمن ليضيفك.",
+            f"أرسل هذا المعرف للأدمن ليضيفك.",
             parse_mode="Markdown"
         )
         return
@@ -373,77 +448,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ✅ Facebook
 ✅ Vimeo, Dailymotion
 ✅ Twitch Clips, Reddit
-✅ وغيرها الكثير...
 """
     await update.message.reply_text(help_msg, parse_mode="Markdown")
-
-async def get_video_info(url):
-    """جلب معلومات الفيديو"""
-    try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': False,
-        }
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info
-    except Exception as e:
-        logger.error(f"Error getting video info: {e}")
-        return None
-
-async def download_media(url, format_type='video', quality='best'):
-    """تحميل الوسائط"""
-    filename = None
-    try:
-        if format_type == 'audio':
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
-                'quiet': True,
-                'no_warnings': True,
-            }
-        elif format_type == 'video':
-            if quality == 'best':
-                ydl_opts = {
-                    'format': 'bestvideo+bestaudio/best',
-                    'merge_output_format': 'mp4',
-                    'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
-                    'quiet': True,
-                    'no_warnings': True,
-                }
-            else:
-                ydl_opts = {
-                    'format': 'worstvideo+worstaudio/worst',
-                    'merge_output_format': 'mp4',
-                    'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
-                    'quiet': True,
-                    'no_warnings': True,
-                }
-        else:
-            ydl_opts = {
-                'format': 'best',
-                'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
-                'quiet': True,
-                'no_warnings': True,
-            }
-
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            
-            if format_type == 'audio':
-                filename = filename.rsplit('.', 1)[0] + '.mp3'
-            
-            return filename
-    except Exception as e:
-        logger.error(f"Download error: {e}")
-        return None
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالجة الروابط المرسلة"""
@@ -451,7 +457,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username
     
-    # التحقق من الصلاحية أولاً
     if not is_allowed(user_id):
         await update.message.reply_text(
             f"⛔ غير مصرح لك باستخدام هذا البوت.\n\n🆔 معرفك: `{user_id}`\nأرسل هذا المعرف للأدمن لإضافتك.",
@@ -459,46 +464,48 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # التحقق من صحة الرابط
     url_pattern = re.compile(r'https?://[^\s]+')
     if not url_pattern.match(url):
         await update.message.reply_text("❌ يرجى إرسال رابط صحيح (يبدأ بـ http:// أو https://)")
         return
     
-    # تسجيل الاستخدام
     log_usage(user_id, username, "download_request", url)
     
-    # إرسال رسالة جاري المعالجة
-    processing_msg = await update.message.reply_text("🔄 جاري تحليل الرابط...")
+    processing_msg = await update.message.reply_text("🔄 جاري تحليل الرابط... (قد يستغرق 10-15 ثانية)")
     
-    # جلب معلومات الفيديو
-    info = await get_video_info(url)
-    if not info:
-        await processing_msg.edit_text("❌ لا يمكن الوصول إلى هذا الرابط. تأكد من صحة الرابط ودعم المنصة.")
-        return
-    
-    # استخراج معلومات العرض
-    title = info.get('title', 'بدون عنوان')[:50]
-    duration = info.get('duration', 0)
-    duration_str = f"{duration // 60}:{duration % 60:02d}" if duration else "غير معروف"
-    
-    # إنشاء أزرار الاختيار
-    keyboard = [
-        [InlineKeyboardButton("🎬 فيديو (أعلى جودة)", callback_data=f"video_best|{url}")],
-        [InlineKeyboardButton("📱 فيديو (جودة منخفضة)", callback_data=f"video_worst|{url}")],
-        [InlineKeyboardButton("🎵 صوت MP3 فقط", callback_data=f"audio|{url}")],
-    ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    info_text = f"""
+    try:
+        info = await asyncio.wait_for(get_video_info(url), timeout=30.0)
+        
+        if not info:
+            await processing_msg.edit_text("❌ فشل تحليل الرابط. تأكد من صحة الرابط أو حاول مرة أخرى.")
+            return
+        
+        title = info.get('title', 'بدون عنوان')[:50]
+        duration = info.get('duration', 0)
+        duration_str = f"{duration // 60}:{duration % 60:02d}" if duration else "غير معروف"
+        
+        keyboard = [
+            [InlineKeyboardButton("🎬 فيديو (أعلى جودة)", callback_data=f"video_best|{url}")],
+            [InlineKeyboardButton("📱 فيديو (جودة منخفضة)", callback_data=f"video_worst|{url}")],
+            [InlineKeyboardButton("🎵 صوت MP3 فقط", callback_data=f"audio|{url}")],
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        info_text = f"""
 📌 *العنوان:* {title}
 ⏱️ *المدة:* {duration_str}
 🌐 *المنصة:* {info.get('extractor', 'غير معروف')}
 
 *اختر جودة التحميل:*
 """
-    await processing_msg.edit_text(info_text, reply_markup=reply_markup, parse_mode="Markdown")
+        await processing_msg.edit_text(info_text, reply_markup=reply_markup, parse_mode="Markdown")
+        
+    except asyncio.TimeoutError:
+        await processing_msg.edit_text("❌ استغرق التحليل وقتاً طويلاً. الرابط قد يكون معقداً أو المنصة محمية.")
+    except Exception as e:
+        logger.error(f"Handle URL error: {e}")
+        await processing_msg.edit_text(f"❌ حدث خطأ: {str(e)[:100]}")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالجة اختيار المستخدم"""
@@ -515,18 +522,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     username = query.from_user.username
     
-    # التحقق من الصلاحية مرة أخرى
     if not is_allowed(user_id):
         await query.edit_message_text("⛔ صلاحياتك منتهية. تواصل مع الأدمن.")
         return
     
-    # تسجيل الاستخدام
     log_usage(user_id, username, f"download_{action}", url)
     
-    # إرسال رسالة جاري التحميل
     await query.edit_message_text("⬇️ جاري تحميل الملف... قد يستغرق هذا دقيقة أو اثنتين ⏳")
     
-    # تحديد نوع التحميل والجودة
     if action == "video_best":
         filename = await download_media(url, 'video', 'best')
         file_type = "فيديو"
@@ -544,7 +547,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ فشل التحميل. تأكد من الرابط أو حاول مرة أخرى لاحقاً.")
         return
     
-    # إرسال الملف إلى المستخدم
     try:
         with open(filename, 'rb') as file:
             if file_type == "صوت MP3":
@@ -553,9 +555,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_video(chat_id=user_id, video=file, supports_streaming=True)
         
         await query.edit_message_text(f"✅ تم التحميل بنجاح!\n📁 {file_type}: {os.path.basename(filename)}")
-        
-        # حذف الملف المؤقت
         os.remove(filename)
+        
     except Exception as e:
         logger.error(f"Error sending file: {e}")
         await query.edit_message_text(f"❌ حدث خطأ أثناء إرسال الملف: {str(e)[:100]}")
@@ -568,11 +569,8 @@ def main():
         print("❌ يرجى تعيين BOT_TOKEN في متغيرات البيئة")
         return
     
-    # تهيئة قاعدة البيانات
     init_db()
-    print("✅ قاعدة البيانات جاهزة")
     
-    # إنشاء التطبيق
     app = Application.builder().token(BOT_TOKEN).build()
     
     # أوامر الأدمن
@@ -592,7 +590,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_handler(CallbackQueryHandler(handle_callback))
     
-    # تشغيل البوت
     print(f"{'='*50}")
     print("🚀 تشغيل البوت مع نظام الإدارة...")
     print(f"👑 الأدمن ID: {ADMIN_ID}")
