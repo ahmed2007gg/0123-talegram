@@ -7,19 +7,17 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     wget \
     curl \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
-# تثبيت yt-dlp مباشرة من pip
-RUN pip install --upgrade pip
-RUN pip install yt-dlp
+# تثبيت yt-dlp
+RUN pip install --upgrade pip && pip install yt-dlp
 
-# نسخ متطلبات Python وتثبيتها
+# نسخ المتطلبات وتثبيتها
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# نسخ باقي الملفات
-COPY . .
+# نسخ الكود
+COPY bot.py .
 
-# أمر التشغيل
+# التشغيل
 CMD ["python", "bot.py"]
