@@ -1,4 +1,197 @@
 #!/usr/bin/env python3
+import os
+import re
+import sqlite3
+import logging
+import asyncio
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from yt_dlp import YoutubeDL
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# ==================== إعدادات yt-dlp المحسنة ====================
+YDL_OPTS = {
+    'quiet': True,
+    'no_warnings': True,
+    'ignoreerrors': True,
+    'no_check_certificate': True,
+    'extract_flat': False,
+    'force_generic_extractor': False,
+    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'referer': 'https://www.youtube.com/',
+    'geo_bypass': True,
+    'geo_bypass_country': 'US',
+    'retries': 10,
+    'fragment_retries': 10,
+}
+
+# ==================== دوال التحميل ====================
+async def get_video_info(url):
+    for attempt in range(3):
+        try:
+            with YoutubeDL(YDL_OPTS) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info:
+                    return info
+        except Exception as e:
+            logger.warning(f"Attempt {attempt+1} failed: {e}")
+            await asyncio.sleep(2)
+    return None
+
+async def download_media(url, format_type='video', quality='best'):
+    try:
+        ydl_opts = YDL_OPTS.copy()
+        ydl_opts['paths'] = {'home': DOWNLOAD_DIR}
+        ydl_opts['outtmpl'] = '%(title)s.%(ext)s'
+        
+        if format_type == 'audio':
+            ydl_opts['format'] = 'bestaudio/best'
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+        elif format_type == 'video':
+            ydl_opts['format'] = 'best[height<=720]/best' if quality == 'best' else 'worst'
+        
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info:
+                filename = ydl.prepare_filename(info)
+                if format_type == 'audio':
+                    filename = filename.rsplit('.', 1)[0] + '.mp3'
+                if os.path.exists(filename):
+                    return filename
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+    return None
+
+# ==================== بقية الدوال (نفس الكود السابق) ====================
+# ... (أضف هنا دوال قاعدة البيانات والأدمن كما هي من الكود السابق) ...
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔ غير مصرح لك باستخدام هذا البوت.")
+        return
+    
+    processing_msg = await update.message.reply_text("🔄 جاري تحليل الرابط... (قد يستغرق 15-20 ثانية)")
+    
+    try:
+        info = await asyncio.wait_for(get_video_info(url), timeout=60.0)
+        
+        if not info:
+            await processing_msg.edit_text("❌ فشل تحليل الرابط. جرب:\n1. رابط من منصة أخرى\n2. أعد المحاولة لاحقاً\n3. تأكد من أن الرابط صحيح")
+            return
+        
+        title = info.get('title', 'بدون عنوان')[:50]
+        duration = info.get('duration', 0)
+        duration_str = f"{duration // 60}:{duration % 60:02d}" if duration else "غير معروف"
+        
+        keyboard = [
+            [InlineKeyboardButton("🎬 فيديو (أعلى جودة)", callback_data=f"video_best|{url}")],
+            [InlineKeyboardButton("🎵 صوت MP3 فقط", callback_data=f"audio|{url}")],
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        info_text = f"""
+📌 *العنوان:* {title}
+⏱️ *المدة:* {duration_str}
+🌐 *المنصة:* {info.get('extractor', 'غير معروف')}
+
+*اختر جودة التحميل:*
+"""
+        await processing_msg.edit_text(info_text, reply_markup=reply_markup, parse_mode="Markdown")
+        
+    except asyncio.TimeoutError:
+        await processing_msg.edit_text("❌ استغرق التحليل وقتاً طويلاً. الرابط قد يكون محظوراً أو المنصة تعطل.")
+    except Exception as e:
+        await processing_msg.edit_text(f"❌ خطأ: {str(e)[:100]}")
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    parts = data.split('|', 1)
+    if len(parts) != 2:
+        await query.edit_message_text("❌ حدث خطأ")
+        return
+    
+    action, url = parts
+    user_id = query.from_user.id
+    
+    await query.edit_message_text("⬇️ جاري التحميل... ⏳")
+    
+    if action == "video_best":
+        filename = await download_media(url, 'video', 'best')
+        file_type = "فيديو"
+    elif action == "audio":
+        filename = await download_media(url, 'audio')
+        file_type = "صوت MP3"
+    else:
+        await query.edit_message_text("❌ خيار غير صالح")
+        return
+    
+    if not filename:
+        await query.edit_message_text("❌ فشل التحميل. حاول مرة أخرى أو استخدم رابطاً مختلفاً.")
+        return
+    
+    try:
+        with open(filename, 'rb') as file:
+            if file_type == "صوت MP3":
+                await context.bot.send_audio(chat_id=user_id, audio=file)
+            else:
+                await context.bot.send_video(chat_id=user_id, video=file, supports_streaming=True)
+        
+        await query.edit_message_text(f"✅ تم التحميل بنجاح!")
+        os.remove(filename)
+    except Exception as e:
+        await query.edit_message_text(f"❌ خطأ في الإرسال: {str(e)[:100]}")
+
+# ... (أضاف دوال start, help, get_id, admin commands من الكود السابق) ...
+
+def main():
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("❌ يرجى تعيين BOT_TOKEN")
+        return
+    
+    init_db()
+    
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # أوامر عامة
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("getid", get_id))
+    
+    # أوامر الأدمن
+    app.add_handler(CommandHandler("adduser", adduser))
+    app.add_handler(CommandHandler("removeuser", removeuser))
+    app.add_handler(CommandHandler("users", users))
+    app.add_handler(CommandHandler("logs", logs))
+    
+    # معالجة الروابط
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    
+    print("🚀 البوت يعمل...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Universal Downloader Bot - Admin Edition with Full Fixes
 # يدعم: تحميل فيديوهات/صور/صوت من أي منصة
